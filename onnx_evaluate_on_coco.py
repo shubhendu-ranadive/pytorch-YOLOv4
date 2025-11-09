@@ -16,16 +16,15 @@ import time
 from collections import defaultdict
 
 import numpy as np
-import torch
-from PIL import Image, ImageDraw
+import cv2
 from easydict import EasyDict as edict
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
 from cfg import Cfg
-from tool.darknet2pytorch import Darknet
+import onnxruntime
 from tool.utils import load_class_names
-from tool.torch_utils import do_detect
+from tool.torch_utils import do_detect_onnx
 
 
 def get_class_name(cat):
@@ -107,50 +106,6 @@ def evaluate_on_coco(cfg, resFile):
     cocoGt = COCO(cfg.gt_annotations_path)
     cocoDt = cocoGt.loadRes('temp.json')
 
-    with open(cfg.gt_annotations_path, 'r') as f:
-        gt_annotation_raw = json.load(f)
-        gt_annotation_raw_images = gt_annotation_raw["images"]
-        gt_annotation_raw_labels = gt_annotation_raw["annotations"]
-
-    rgb_label = (255, 0, 0)
-    rgb_pred = (0, 255, 0)
-
-    for i, image_id in enumerate(reshaped_annotations):
-        image_annotations = reshaped_annotations[image_id]
-        gt_annotation_image_raw = list(filter(
-            lambda image_json: image_json['id'] == image_id, gt_annotation_raw_images
-        ))
-        gt_annotation_labels_raw = list(filter(
-            lambda label_json: label_json['image_id'] == image_id, gt_annotation_raw_labels
-        ))
-        if len(gt_annotation_image_raw) == 1:
-            image_path = os.path.join(cfg.dataset_dir, gt_annotation_image_raw[0]["file_name"])
-            actual_image = Image.open(image_path).convert('RGB')
-            draw = ImageDraw.Draw(actual_image)
-
-            for annotation in image_annotations:
-                if annotation['score'] < 0.3:
-                    continue
-                x1_pred, y1_pred, w, h = annotation['bbox']
-                x2_pred, y2_pred = x1_pred + w, y1_pred + h
-                cls_id = annotation['category_id']
-                label = get_class_name(cls_id)
-                draw.text((x1_pred, y1_pred), label, fill=rgb_pred)
-                draw.rectangle([x1_pred, y1_pred, x2_pred, y2_pred], outline=rgb_pred)
-            for annotation in gt_annotation_labels_raw:
-                x1_truth, y1_truth, w, h = annotation['bbox']
-                x2_truth, y2_truth = x1_truth + w, y1_truth + h
-                cls_id = annotation['category_id']
-                label = get_class_name(cls_id)
-                draw.text((x1_truth, y1_truth), label, fill=rgb_label)
-                draw.rectangle([x1_truth, y1_truth, x2_truth, y2_truth], outline=rgb_label)
-            actual_image.save("./data/outcome/predictions_{}".format(gt_annotation_image_raw[0]["file_name"]))
-        else:
-            print('please check')
-            break
-        if (i + 1) % 100 == 0: # just see first 100
-            break
-
     imgIds = sorted(cocoGt.getImgIds())
     cocoEval = COCOeval(cocoGt, cocoDt, annType)
     cocoEval.params.imgIds = imgIds
@@ -167,14 +122,9 @@ def test(model, annotations, cfg):
     # images = images[:10]
     resFile = 'data/coco_val_outputs.json'
 
-    if torch.cuda.is_available():
-        use_cuda = 1
-    else:
-        use_cuda = 0
-
     # do one forward pass first to circumvent cold start
-    throwaway_image = np.array(Image.open('./data/dog.jpg').convert('RGB').resize((model.width, model.height)))
-    do_detect(model, throwaway_image, 0.5, 0.4, use_cuda)
+    throwaway_image = cv2.imread('./data/dog.jpg')
+    do_detect_onnx(model, throwaway_image, 0.5, 0.4)
     boxes_json = []
 
     for i, image_annotation in enumerate(images):
@@ -185,14 +135,10 @@ def test(model, annotations, cfg):
         image_width = image_annotation["width"]
 
         # open and resize each image first
-        img = Image.open(os.path.join(cfg.dataset_dir, image_file_name)).convert('RGB')
-        sized = np.array(img.resize((model.width, model.height)))
-
-        if use_cuda:
-            model.cuda()
+        img = cv2.imread(os.path.join(cfg.dataset_dir, image_file_name))
 
         start = time.time()
-        boxes = do_detect(model, sized, 0.001, 0.4, use_cuda)[0]
+        boxes = do_detect_onnx(model, img, 0.001, 0.4)[0]
         finish = time.time()
         if type(boxes) == list:
             for box in boxes:
@@ -217,15 +163,9 @@ def test(model, annotations, cfg):
                 box_json["timing"] = float(finish - start)
                 boxes_json.append(box_json)
                 # print("see box_json: ", box_json)
-                # with open(resFile, 'w') as outfile:
-                #     json.dump(boxes_json, outfile, default=myconverter)
         else:
             print("warning: output from model after postprocessing is not a list, ignoring")
             return
-
-        # namesfile = 'data/coco.names'
-        # class_names = load_class_names(namesfile)
-        # plot_boxes(img, boxes, 'data/outcome/predictions_{}.jpg'.format(image_id), class_names)
 
     with open(resFile, 'w') as outfile:
         json.dump(boxes_json, outfile, default=myconverter)
@@ -237,15 +177,11 @@ def get_args(**kwargs):
     cfg = kwargs
     parser = argparse.ArgumentParser(description='Test model on test dataset',
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('-f', '--load', dest='load', type=str, default=None,
-                        help='Load model from a .pth file')
-    parser.add_argument('-g', '--gpu', metavar='G', type=str, default='-1',
-                        help='GPU', dest='gpu')
     parser.add_argument('-dir', '--data-dir', type=str, default=None,
                         help='dataset dir', dest='dataset_dir')
     parser.add_argument('-gta', '--ground_truth_annotations', type=str, default='instances_val2017.json',
                         help='ground truth annotations file', dest='gt_annotations_path')
-    parser.add_argument('-w', '--weights_file', type=str, default='weights/yolov4.weights',
+    parser.add_argument('-w', '--weights_file', type=str, default='weights/yolov4.onnx',
                         help='weights file to load', dest='weights_file')
     parser.add_argument('-c', '--model_config', type=str, default='cfg/yolov4.cfg',
                         help='model config file to load', dest='model_config')
@@ -295,20 +231,6 @@ def init_logger(log_file=None, log_dir=None, log_level=logging.INFO, mode='w', s
 if __name__ == "__main__":
     logging = init_logger(log_dir='log')
     cfg = get_args(**Cfg)
-    os.environ["CUDA_VISIBLE_DEVICES"] = cfg.gpu
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logging.info(f'Using device {device}')
-
-    model = Darknet(cfg.model_config)
-
-    model.print_network()
-    model.load_weights(cfg.weights_file)
-    model.eval()  # set model away from training
-
-    if torch.cuda.device_count() > 1:
-        model = torch.nn.DataParallel(model)
-
-    model.to(device=device)
 
     annotations_file_path = cfg.gt_annotations_path
     with open(annotations_file_path) as annotations_file:
@@ -317,6 +239,8 @@ if __name__ == "__main__":
         except:
             print("annotations file not a json")
             exit()
+    
+    model = onnxruntime.InferenceSession(cfg.weights_file)
     test(model=model,
          annotations=annotations,
          cfg=cfg, )

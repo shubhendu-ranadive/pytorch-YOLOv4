@@ -1,14 +1,9 @@
 import sys
 import os
 import time
-import math
 import torch
 import numpy as np
-from torch.autograd import Variable
-
-import itertools
-import struct  # get_image_size
-import imghdr  # get_image_size
+import cv2
 
 from tool import utils 
 
@@ -103,3 +98,29 @@ def do_detect(model, img, conf_thresh, nms_thresh, use_cuda=1):
 
         return utils.post_processing(img, conf_thresh, nms_thresh, output)
 
+def do_detect_onnx(model, img, conf_thresh, nms_thresh):
+    IN_IMAGE_H = model.get_inputs()[0].shape[2]
+    IN_IMAGE_W = model.get_inputs()[0].shape[3]
+
+    # Input
+    t0 = time.time()
+    resized = cv2.resize(img, (IN_IMAGE_W, IN_IMAGE_H), interpolation=cv2.INTER_LINEAR)
+    img_in = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    img_in = np.transpose(img_in, (2, 0, 1)).astype(np.float32)
+    img_in = np.expand_dims(img_in, axis=0)
+    img_in /= 255.0
+
+    input_name = model.get_inputs()[0].name
+
+    t1 = time.time()
+
+    outputs = model.run(None, {input_name: img_in})
+
+    t2 = time.time()
+
+    print('-----------------------------------')
+    print('           Preprocess : %f' % (t1 - t0))
+    print('      Model Inference : %f' % (t2 - t1))
+    print('-----------------------------------')
+
+    return utils.post_processing(img, conf_thresh, nms_thresh, outputs)
